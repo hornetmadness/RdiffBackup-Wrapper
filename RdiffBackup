@@ -1,0 +1,718 @@
+#!/usr/bin/perl -w
+#Created 8/2017
+#wrapper around rdiff-backup cli tool
+#V1.0 Inital
+#v1.1 Added top level pre/post run 
+#v1.2 Added runretention options and removes missing sources from $config
+#v1.2.1 Added rdiffbackup version to report
+#v1.2.2 Added --check-destination-dir rdiff-backup command
+#v1.2.3 Added backup destination to report
+#v1.2.4 Code Clean up
+#v1.3 Added lockfile to prevent dup process
+#v1.4 Can now specify smtp server, port and allowed --time on --runrentention
+
+
+use strict;
+use Getopt::Long;
+use JSON;
+use FindBin qw($Script);
+use Data::Dumper;
+use Mail::Sendmail;
+
+my $VERSION="1.4";
+
+my %opt;
+GetOptions( #GET CLI OPTIONS
+    \%opt,
+    'bkuphost|b:s',
+    'back2disk|a:s',
+    'config|c:s',
+    'cron',
+    'debug',
+    'emailto|e:s',
+    'help|h',
+    'keyfile|k:s',
+    'source|s:s',
+    'force|f',
+    'restore|r:s',
+    'dest|d:s',
+    'time|t:s',
+    'verify|v',
+    'list|l:s',
+    'listchanged|g:s',
+    'port|p:i',
+    'runretention|n:s',
+    'lockfile|o:s',
+    'lockfileage|z:n',
+    'smtpserver|j:s',
+    'smtpserverport|i:n'
+);
+
+my $process=$0; $process =~ s/^.*\/|\.p[ml]//g;
+my $config; #hashref to hold config vals
+my $backupstate=0; #0 passed, non-zero failed
+my $rdiffCmdOpt;
+my $rdiffDefOpts="--exclude-sockets --exclude-fifos --exclude-device-files --create-full-path";
+my $defaultConfig = "/etc/$process.conf";
+my $lockfile = "/var/tmp/$process.lock";
+my $lockfileage=86400; #seconds
+
+&help if $opt{help};
+
+my $debug=0;
+$debug=$opt{debug} if $opt{debug};
+$|=1 if $debug;
+print "DEBUG is ON\n" if $debug;
+print Dumper %opt if $debug;
+
+my $rdeep=1;
+
+&readconfig;
+
+if ( -e $config->{lockfile} ) {
+    my $now=time();
+    my @age=stat($config->{lockfile});
+    my $old = $now - $age[9];
+    if ( $old >= $config->{lockfileage} ) {
+        unlink($config->{lockfile});
+        addmess("Found Stale lockfile ($old seconds), removed\n");
+    } else {
+        addmess("Lockfile Found, exiting");
+        &make_a_mess;
+        exit 1;
+    }
+}
+
+print "\nCreating lockfile $config->{lockfile}\n" if $debug;
+touch($config->{lockfile});
+
+my @mess; #Holds the email message
+addmess("\nVersion: $VERSION\n");
+my ($rdiffVersion, $ecode)=doit("rdiff-backup --version");
+addmess("$rdiffVersion->[0]\n");
+addmess("Destination: $config->{destination}\n");
+
+
+#restore mode
+if ($opt{restore}) {
+    if (!$opt{time}) { help("Input --time required"); }
+
+    #Default
+    if (!$opt{dest}) { $opt{dest}=$opt{restore}; }
+
+    print "Restoring $opt{restore} from $config->{destination} at $opt{time} to $opt{dest}\n";
+    
+    my $rcmd="--restore-as-of $opt{time}";
+    my $restorecmd=buildRdiffCmd({ opts => $rcmd, dest=>$opt{dest}, src=>$opt{restore}, restore => 1 });
+    my ($res, $ecode)=doit($restorecmd);
+
+    foreach my $line (@{$res}) { print $line,"\n"; }
+    if ($ecode) {
+        death($ecode);
+    }
+
+    &recursive($opt{dest});
+    
+    death(0); #end of restore mode.
+}
+
+#list all backups
+if ( defined $opt{list} ) { 
+    print "Getting List of backups\n" if $debug;
+    my $ecode = &list_inc;
+    death($ecode);
+}
+
+#show things that changed from now to --time
+if ( defined $opt{listchanged} ) {
+
+    print "Getting List of changes\n" if $debug;
+
+    my @srcs;
+    if ( $opt{listchanged}) { @srcs=$opt{listchanged}; }
+    else {
+        push(@srcs, keys %{$config->{sources}});
+    }
+
+    if ( !$opt{time} ) { 
+        foreach my $src (@srcs) { list_inc($src); }
+        help("Inupt --time is required, try one of the times above"); 
+    }
+
+    my $errcode=0;
+    foreach my $src(@srcs) {
+        print "--$src\n";
+        my $ccmd="--list-changed-since $opt{time}";
+        my $chgcmd=buildRdiffCmd({opts => $ccmd, dest => $src});
+
+        my ($res, $ecode)=doit($chgcmd);
+        foreach my $line ( @{$res}) { print $line,"\n"; }
+        $errcode=$ecode if $ecode;
+    }
+    death($errcode);
+} #End of listchanged  
+
+
+#manually run the retention task
+if ($opt{runretention}) {
+    if (! $config->{sources}{ $opt{runretention} } || !$opt{time}) {
+        print "Failed to find $opt{runretention} in the config sources\n";
+        death(1);
+    }
+    my $retention;
+    if ($opt{time}) {
+        $retention = $opt{time};
+    } elsif ( $config->{sources}{ $opt{runretention} } ) {
+        $retention =  $config->{sources}{ $opt{runretention} };
+    } else {
+        $retention = $config->{defaultretention};
+    }
+    my $rcmd = "--remove-older-than $retention";
+    my $cmd = buildRdiffCmd( { opts => $rcmd, dest=>$opt{runretention}} );
+    my ($res, $ecode)=doit( $cmd );
+    foreach  my $line (@{$res}){
+        print "$line\n";
+    }
+    death($ecode);
+}
+
+#Defaults to backup mode if the above options arnt sent
+my $sources = $config->{sources};
+
+##DEFAULT backup mode
+if (!%{$sources}) {
+    my $mess="No sources defined!";
+    addmess($mess);
+    $backupstate=$mess;
+} else {
+    if ( $config->{prerun} && @{$config->{prerun}} ) {
+        for my $prerun (@{$config->{prerun}}) {
+            my $tmess="-Running top level PreRun task: $prerun\n";
+            print "$tmess\n" if $debug;
+            addmess($tmess);
+            my ($res, $ecode)=doit( $prerun );
+            addmess($res) if $res;
+            if ( $ecode ) {
+                addmess($res) if $res;
+                my $mess="The top level PreRun task failed: $prerun\n";
+                addmess($mess);
+                print "$mess\n" if $debug;
+                death(1);
+            }
+            addmess("-"x25);
+        }
+    }
+    my $hazsrc=0;
+    for my $src (keys %{$sources}) {
+        if ($opt{source} and $opt{source} ne $src) { next; }
+        $hazsrc=1;
+        #make a ref to save some typing
+        my $obj=$sources->{$src};
+
+        print "Source: $src\n" if $debug;
+        print Data::Dumper->new([$obj],[qw(*src-attributes)])->Indent(3)->Quotekeys(0)->Dump if $debug;
+        addmess("-$src");
+
+        if (! -e $src) {
+            addmess("Warning backup source $src was not found!");
+            next;
+        }
+
+        #perform any prerun tasks
+        if ($obj->{prerun}) {
+            addmess("---PreRun");
+            addmess($obj->{prerun});
+            print "Running PreRun task \"$obj->{prerun}\" for $src\n" if $debug;
+            my ($res, $ecode)=doit( $obj->{prerun} );
+            addmess($res) if $res;
+            if ( $ecode ) {
+                my $mess="Prerun Task Failed, skipping backup of $src";
+                addmess($mess);
+                if (!$obj->{ignoreprefail} ) {
+                    $backupstate=$mess;
+                    next;
+                }
+            }
+        }
+        
+        #build the command based on the config options for the actual backup
+        my $pcmd="--print-statistics";
+        if ($obj->{rdiffopts}) { 
+            $pcmd.=" $obj->{rdiffopts}"; 
+        } else {
+            $pcmd.=" $rdiffDefOpts";
+        }
+
+        if ($obj->{excludes}) {
+            foreach my $thing ( @{ $obj->{excludes} } ) {
+                $pcmd.=" --exclude \"$thing\""; 
+            }
+        }
+        my $putcmd=buildRdiffCmd({ opts =>$pcmd, src=> $src, dest => $src });
+        
+        print "Starting Backup Task for $src\n" if $debug;
+        my ($res, $ecode)=doit($putcmd);
+        addmess($res) if $res;
+        if ($ecode) { 
+            my $mess="Backup Tasked Failed for source $src";
+            addmess($mess); 
+            $backupstate=$mess;
+            next; 
+        }
+
+        #verify the backup if config'd to do so
+        if ($obj->{verify} or $opt{verify}) { 
+            my $vcmd="--verify ";
+            if ($obj->{excludes}) {
+                foreach my $thing ( @{ $obj->{excludes} } ) { $vcmd.="--exclude \"$thing\" "; }
+            }
+            
+            print "Verifying Backup for $src\n" if $debug;
+            addmess("---Verify");
+
+            my $vercmd=buildRdiffCmd({ opts => $vcmd, dest => $src });
+            my ($res, $ecode)=doit($vercmd);
+            addmess($res) if $res;
+            if ($ecode) { 
+                my $mess="Verify Task Failed for $src";
+                addmess($mess);
+                $backupstate=$mess;
+                next; 
+            }
+        }
+
+        #Write out the buffers if local disk backup
+        if ($config->{back2disk}) { doit("sync"); }
+
+        #run the retention task, always
+        my $dcmd="--force --remove-older-than $obj->{retention}";
+        my $delcmd=buildRdiffCmd({opts => $dcmd, dest=>$src });
+
+        print "Running Retention task\n" if $debug;
+        addmess("---Cleaning");
+        my ($rres, $recode)=doit($delcmd);
+        addmess($rres) if $res;
+        addmess("\n");
+        if ($recode) { 
+            my $mess="Retention Task Failed for $src";
+            addmess($mess); 
+            $backupstate=$mess;
+            next; 
+        }
+        
+        #run any postrun tasks
+        if ($obj->{postrun}) {
+            addmess("---PostRun");
+            addmess($obj->{postrun});
+            print "Running PostRun task \"$obj->{postrun}\" for $src\n" if $debug;
+            my ($res, $ecode)=doit( $obj->{postrun} );
+            addmess($res) if $res;
+            if ($ecode) { 
+                my $mess="Postrun Failed for $src";
+                addmess($mess); 
+                if ( !$obj->{ignorepostfail} ) {
+                    $backupstate=$mess;
+                    next; 
+                }
+            }
+        }
+    } #end of sources
+
+    if ( $config->{postrun} && @{$config->{postrun}} ) {
+        for my $postrun (@{$config->{postrun}}) {
+            my $tmess="-Running top level PostRun task: $postrun\n";
+            print "$tmess\n" if $debug;
+            addmess($tmess);
+            my ($res, $ecode)=doit( $postrun );
+            addmess($res) if $res;
+            if ( $ecode ) {
+                addmess($res) if $res;
+                my $mess="The top level PostRun task failed: $postrun\n";
+                addmess($mess);
+                print "$mess\n" if $debug;
+            }
+            addmess("-"x25);
+        }
+    }
+
+    if (!$hazsrc) {
+        addmess("No sources found in $opt{config}");
+        death(1);
+    }
+}
+#End of backup mode
+death(0);
+
+sub make_a_mess {
+    #print the output from the commands ran above
+    if (@mess) {
+        my $email;
+        foreach my $line (@mess) {
+            if (ref($line) eq "ARRAY" ) {
+                foreach my $aline ( @{$line} ) {
+                    if ($opt{cron}) { $email.=$aline."\n" }
+                    else { print $aline,"\n" }
+                }
+            } else {
+                if ($opt{cron}) { $email.=$line."\n" }
+                else { print $line,"\n" }
+            }
+        }
+        sendEmail($email) if $email;
+    }
+}
+
+#send the report 
+sub sendEmail {
+    return if !$config->{emailto};
+
+    my $mess=shift;
+    death(1, "No message provided") if !$mess;
+
+    my $subject="$process Backup for $config->{hostname} : ";
+    $subject.="Succeeded" if !$backupstate;
+    $subject.="Failed" if $backupstate;
+
+    print "Emailing report $subject\n" if $debug;
+
+    my $message;
+    $message.=$backupstate if $backupstate;
+    $message.=$mess;
+
+    my $smtpdebug=0;
+    $smtpdebug=6 if $debug;
+
+    my %mail;
+    $mail{To} = $config->{emailto};
+    $mail{From} = $config->{emailfrom};
+    $mail{Subject} = $subject;
+    $mail{Message} = $message;
+    $mail{Smtp} = $config->{smtpserver};
+    $mail{Port} = $config->{smtpserverport};
+    $mail{Debug} = $smtpdebug;
+
+    print Dumper %mail if $debug;
+
+    sendmail(%mail);
+    print "SendMail: $Mail::Sendmail::error\n" if $Mail::Sendmail::error;
+}
+
+#builds the rdiff-backup command with options, accouting for local or remote backups
+sub buildRdiffCmd {
+    my $in=shift;
+
+    print "Building Command\n" if $debug;
+    print Data::Dumper->new([$in],[qw(*Input)])->Indent(3)->Quotekeys(0)->Dump if $debug;
+
+    my $cmd="rdiff-backup";
+    my $opts;
+    my $dest="";
+    my $src="";
+    $src=$in->{src} if $in->{src};
+
+    my $rmt;
+    if ($config->{back2disk}) {	
+        $rmt="\'$config->{back2disk}/$config->{hostname}";
+        if ($in->{restore}) {
+            $dest=$in->{dest} if $in->{dest};
+            $src="/archives/$src\'" if $src;
+        } else {
+            $dest="/archives$in->{dest}\'" if $in->{dest};
+        }
+    } else {
+        $rmt="$config->{hostname}\@$config->{bkuphost}";
+        $opts.="$rdiffCmdOpt ";
+
+        if ($in->{restore}) {
+            $dest=$in->{dest} if $in->{dest};
+            $src="::archives/$src" if $src;
+        } else {
+            $dest="::archives$in->{dest}" if $in->{dest};
+        }
+    }
+
+    if (!$config->{back2disk}) {
+        $src="\'$src\'" if $src;
+        $dest="\'$dest\'" if $dest;
+    }
+
+    if ($opt{force}) {
+        $opts.="--force ";
+    }
+    $opts.="$in->{opts}" if $in->{opts};
+
+    my $r;
+    if ($in->{restore}) {
+        $r="$cmd $opts $rmt$src $dest"; #in restore mode the src,dest pattern changes
+    } else {
+        $r="$cmd $opts $src $rmt$dest";
+    }
+    return $r;
+}
+
+#Show the past backups, aka increments
+sub list_inc {
+    my $src=shift;
+    my @srcs;
+
+    if ( $opt{list}) { @srcs=$opt{list}; } #cli input
+    elsif ($src) { @srcs=$src; } #sub input
+    else {
+        push(@srcs, keys %{$config->{sources}}); #defualt to config
+    }
+
+    my $errcode=0;
+    foreach my $src (@srcs) {
+        print "--$src\n";
+        my $lcmd="--list-increments ";
+        
+        my $listcmd=buildRdiffCmd({opts => $lcmd, dest => $src});
+
+        my ($res, $ecode)=doit($listcmd);
+
+        foreach my $line ( @{$res} ) { print $line,"\n"; } 
+
+        $errcode=$ecode if $ecode;
+        print "\n";
+    }
+
+    return $errcode;
+}
+
+#simple sub to run a command and pack an array with the results
+sub doit {
+    my $cmd=shift;
+
+    my $ecode=0;
+    print "DOIT -> $cmd\n" if $debug;
+    my @results;
+    open (DO, "$cmd 2>&1|") or death("Cant run $cmd $!\n");
+    while (my $res = <DO>) {
+        #chomp($res);
+
+        $res =~ s/\n//;
+        push(@results,$res);
+    }
+    close DO;
+    $ecode= $? >> 8;
+    print "doit() ERROR CODE: $ecode\n" if $debug;
+    return \@results, $ecode;
+}
+
+#check that the restored object exists, then prints a pretty dir/file layout
+sub recursive {
+    my $obj=shift;
+
+    if (!-e $obj) {
+        print "$obj was not found!\n";
+        return;
+    }
+    
+    if ($rdeep <= 1 and -d "$obj" ) { print "+$obj\n"; }
+
+    if ( -d $obj ) {
+        #print "recursive(): Reading Dir $obj\n" if $debug;
+        opendir(DIR, $obj) or death(1, "$obj was not found, restore failed\n");
+        my @objs = grep { !/^\.{1,2}$/ && -e "$obj/$_" } readdir(DIR);
+        close DIR;
+
+        my @dirs;
+        foreach my $file (@objs) {
+            my $f="$obj/$file";
+            if (-d $f) {
+                push(@dirs, $f);
+            } else {
+                print "\t"x$rdeep;
+                print "|$file\n";
+            }
+        }
+    
+        if (@dirs) {
+            foreach my $dir (@dirs) {
+                print "\t"x$rdeep;
+                print "+$dir\n";
+                $rdeep++;
+                recursive($dir)
+            }
+        }
+        $rdeep--;
+        return;
+    }
+
+    if ( -f $obj ) {
+        print "Restored File $obj\n";
+    } else {
+        death(1,"Restored file $obj wasnt found\n");
+    }
+}
+
+#adds text to the @mess array
+sub addmess  {
+    my $say=shift;
+    push(@mess, $say) if $say;
+}
+
+#parses the config file and performs sanity checks
+sub readconfig {
+    #some sanity checks
+    if ($opt{config}) {
+        if ( ! -e $opt{config} or ! -r $opt{config}) { die "Cant read config file $opt{config}\n"; }
+    } else {
+        #default
+        $opt{config}=$defaultConfig;
+    }
+
+    #read in config	
+    my $json = JSON->new->allow_nonref->relaxed;
+    local $/;
+    open(my $CFG, '<', $opt{config} ) or die "Cant in read config: $opt{config}\n";
+    $config=$json->decode( <$CFG> ) or die "Cant decode config file $opt{config} :: $@\n";
+    close $CFG;
+
+    #defalut to the local hostname if none was given
+    if ($opt{hostname}) { $config->{hostname}= $opt{hostname}; }
+    if (!$config->{hostname}) {  #dont blame me, blame cron.
+        my ($res, $ecode)=doit("hostname");
+        $config->{hostname} = $res->[0] if $res->[0];
+        $config->{domain} = "localhost";
+        if (!$config->{hostname} or $ecode) {
+            help("Cant get hostname, consider setting the hostname key/val in the config file $opt{config}");
+        } else {
+            my @t=split(".", $config->{hostname});
+            shift(@t);
+            $config->{domain} = join(".", @t);
+        }
+    }
+
+    if ($opt{back2disk}) { $config->{back2disk} = $opt{back2disk}; }
+    if ($opt{bkuphost}) { $config->{bkuphost} = $opt{bkuphost}; }
+
+    if ($config->{back2disk}) {
+        if (! -e "$config->{back2disk}/rdiffbackupdisk") { #disk based backup, file rdiffbackupdisk needs to be in the root to make sure the mount is working.
+            death(1,"Cant find back2disk path $config->{back2disk}/rdiffbackupdisk");
+        }
+        $config->{destination} = "Disk: $config->{back2disk}";
+        addmess("rdiffbackupdisk details");
+        open (IN, "$config->{back2disk}/rdiffbackupdisk") or death(1,"Cant read $config->{back2disk}/rdiffbackupdisk\n");
+        while(<IN>) { chomp; addmess($_); }
+        close IN;
+        addmess("\n");
+    } else { #backup via ssh
+        
+        if (!$config->{bkuphost}) { 
+            #my ($domain, $ecode)=doit("hostname -d");
+            if ($ecode > 0) {
+                death(1,"Cant figure out the domain to generate the bkuphost, please add the key bkuphost to the config\n");
+            }
+            $config->{bkuphost} = "backup.$config->{domain}" ;
+        }
+        $config->{destination} = "Remote: $config->{bkuphost}";
+        if ( $opt{sshport} ) { $config->{sshport} = $opt{sshport}; }
+        if (!$config->{sshport}) { $config->{sshport} = 22; }
+
+        if ( $opt{keyfile}) { $config->{keyfile} = $opt{keyfile}; }
+        
+        $rdiffCmdOpt="--remote-schema \"ssh -o Port=$config->{sshport} -o StrictHostKeyChecking=no ";
+        $rdiffCmdOpt.="-o IdentityFile=$config->{keyfile} " if $config->{keyfile};
+        $rdiffCmdOpt.="%s rdiff-backup --server\"";
+    }
+
+    if ( $opt{emailto} ) { $config->{emailto} = $opt{emailto}; }
+    if ( !$config->{emailto} ) { $config->{emailto} = "netbackup\@$config->{domain}"; }
+    if ( !$config->{emailfrom} ) { $config->{emailfrom} = "$process\@$config->{hostname}" }
+
+    if (!$config->{defaultretention}) { $config->{defaultretention} = "33D"; }
+
+    my @delsrc;
+    for my $src (keys %{$config->{sources}} ) {
+        if ( ! -e $src ) {
+            print "Source $src was not found, removing\n";
+            push(@delsrc, $src);
+            next;
+        }
+        if ( ! $config->{sources}{$src}{retention} ) { $config->{sources}{$src}{retention} = $config->{defaultretention}; } 
+
+    }
+    if (@delsrc) {
+        foreach my $src (@delsrc) {
+            delete $config->{sources}{$src};
+        }
+    }
+
+    if ($opt{lockfile}) { $config->{lockfile} = $opt{lockfile}; }
+    if (!$config->{lockfile}) {
+        $config->{lockfile} = $lockfile;
+    }
+
+    if ($opt{lockfileage}) { $config->{lockfileage} = $opt{lockfileage}; }
+    if (!$config->{lockfileage}) {
+        $config->{lockfileage} = $lockfileage;
+    }
+
+
+    if ($opt{smtpserver}) { $config->{smtpserver} = $opt{smtpserver}; }
+    if (!$config->{smtpserver}) {
+        $config->{smtpserver} = "127.0.0.1";
+    }
+
+    if ($opt{smtpserverport}) { $config->{smtpserverport} = $opt{smtpserverport}; }
+    if (!$config->{smtpserverport}) {
+        $config->{smtpserverport} = 25;
+    }
+
+    print Data::Dumper->new([$config],[qw(*config*)])->Indent(3)->Quotekeys(0)->Dump if $debug;
+}
+
+sub death {
+    my $ecode=shift;
+    my $mess=shift;
+    print "EXIT($ecode) $mess\n" if $mess;
+    if ( $config->{lockfile} and -e $config->{lockfile} ) {
+        print "Removing lockfile $config->{lockfile}\n";
+        unlink($config->{lockfile});
+    }
+    &make_a_mess;
+    exit $ecode;
+}
+
+sub touch {
+    my $file = shift;
+    my $now = time;
+    local (*TMP);
+    utime ($now, $now, $file)
+    || open (TMP, ">>$file")
+    || death(1,"Couldn't touch file: $!\n");
+} 
+
+#Take a guess
+sub help {
+    my $mess=shift;
+    print "$mess\n\n" if $mess;
+print "$Script <options>
+    back2disk|a <dirpath>\t\t* Sets the mount for local backups
+    bkuphost|b <hostname>\t\t* Sets host to use as the backup host
+    config|c <configfile>\t\tUse this config over the default of $defaultConfig
+    cron\t\t\t\tEnables cron mode so emails are sent.
+    debug\t\t\t\tTurn on Debuging
+    dest|d <objpath>\t\tWhen in restore mode, this changes the destination over the default as defined by --restore
+    emailto|e <address>\t\t* Whom to send the backup report to
+    force|f\t\t\t\tForce a backup to be restored (Could be harmful)
+    hostname <sshuser>\t\t* Set the hostname or username that ssh will auth with
+    keyfile|k <filename>\t\t* SSH Private key to auth with
+    sshport|p <portnumber>\t\t* SSH TCP Port to connect to
+    source|s:s <objpath>\t\t* Used in the default backup mode, it will only backup the source you provided which overrides the config {sources}
+    restore|r <objpath>\t\tSets the object to be restored and will also set the destination unless --dest is used
+    runretention|n <objpath>\t\tRuns the renetion task on the object supplied. Must match whats in the config
+    time|t <time>\t\t\tRestores from n time ago eg.. 10m, 1D, 2017-08-18T15:51:00 (See TIME FORMATS in rdiff-backup manual)
+    verify|v\t\t\t* Verify the backup job
+    list|l <objpath>\t\tLists what backups had changes
+    listchanged|g <objpath>\t\tLists which files changed and were also backed up, requires --time
+    lockfile|o <filename>\t\tFile Used to create locking, default is $lockfile
+    lockfileage|z <secnods>\tMax age (in seconds) of said lockfile, default is $lockfileage
+    smtpserver|j <hostname|IP>\tSMTP Relay, default is localhost
+    smtpserverport|i <number>\tWhat port to connect to the replay on, default is 25
+
+    * = Overrides config file keys
+Version:$VERSION\n";
+    death(1);
+}

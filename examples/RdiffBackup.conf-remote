@@ -1,0 +1,36 @@
+{
+	"hostname": "override the remoteclient hostname",
+	"bkuphost": "Name of the remote host",
+	"emailto": "you@email.com",
+        "prerun": [ "hostname", "whoami" ],
+        "defaultretention": "33D",
+        "lockfile: "/var/tmp/lockfile",
+        "lockfileage": "86400",
+        "smtpserver: "mailrelay.domain.com",
+        "smtpserverport": 25,
+        "sshport": 2222,
+	"keyfile": "/root/.ssh/altkey",
+	"sources": {
+		"/etc": {
+			"excludes": [ "**rpmnew", "**rpmsave", "/etc/iptables/sets" ],
+			"retention": "90D",
+			"verify": "1"
+		},
+		"/home/username": {
+			"excludes": [ "**.bash_history", "**Downloads", "**tmp", "**.cache", "**.npm", "**go/pkg", "**build" ],
+			"retention": "21D"
+		},
+		"/opt": {
+			"excludes": [ "**backup" ]
+		},
+		"/root": { 
+			"excludes": [ "**.bash_history", "**.yarn", "**.cache", "**.npm", "**go/pkg" ],
+		},
+		"/var/www/vhosts": {
+			"excludes": [ "**.log" ],
+			"verify": "1"
+		},
+		"/usr/local/bin": {
+		}
+	}
+}
