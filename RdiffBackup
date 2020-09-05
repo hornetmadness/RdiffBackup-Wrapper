@@ -223,7 +223,7 @@ if (!%{$sources}) {
             addmess("---PreRun");
             if ( @{$obj->{prerun}}) {
                 foreach my $run (@{$obj->{prerun}}) {
-                    addmess($$run);
+                    addmess($run);
                     print "Running PreRun task \"$run\" for $src\n" if $debug;
                     my ($res, $ecode)=doit( $run );
                     addmess($res) if $res;
