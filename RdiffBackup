@@ -320,16 +320,34 @@ if (!%{$sources}) {
         #run any postrun tasks
         if ($obj->{postrun}) {
             addmess("---PostRun");
-            addmess($obj->{postrun});
-            print "Running PostRun task \"$obj->{postrun}\" for $src\n" if $debug;
-            my ($res, $ecode)=doit( $obj->{postrun} );
-            addmess($res) if $res;
-            if ($ecode) { 
-                my $mess="Postrun Failed for $src";
-                addmess($mess); 
-                if ( !$obj->{ignorepostfail} ) {
-                    $backupstate=$mess;
-                    next; 
+            if (@{$obj->{postrun}}) {
+                foreach my $prun (@{$obj->{postrun}}) {
+                    addmess("---PostRun");
+                    addmess($prun);
+                    print "Running PostRun task \"$prun\" for $src\n" if $debug;
+                    my ($res, $ecode)=doit( $prun );
+                    addmess($res) if $res;
+                    if ($ecode) { 
+                        my $mess="Postrun Failed for $src";
+                        addmess($mess); 
+                        if ( !$obj->{ignorepostfail} ) {
+                            $backupstate=$mess;
+                            next; 
+                        }
+                    }
+                }   
+            } else {
+                addmess($obj->{postrun});
+                print "Running PostRun task \"$obj->{postrun}\" for $src\n" if $debug;
+                my ($res, $ecode)=doit( $obj->{postrun} );
+                addmess($res) if $res;
+                if ($ecode) { 
+                    my $mess="Postrun Failed for $src";
+                    addmess($mess); 
+                    if ( !$obj->{ignorepostfail} ) {
+                        $backupstate=$mess;
+                        next; 
+                    }
                 }
             }
         }
