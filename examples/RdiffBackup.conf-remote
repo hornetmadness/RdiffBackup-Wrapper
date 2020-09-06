@@ -4,9 +4,9 @@
 	"emailto": "you@email.com",
         "prerun": [ "hostname", "whoami" ],
         "defaultretention": "33D",
-        "lockfile: "/var/tmp/lockfile",
+        "lockfile": "/var/tmp/lockfile",
         "lockfileage": "86400",
-        "smtpserver: "mailrelay.domain.com",
+        "smtpserver": "mailrelay.domain.com",
         "smtpserverport": 25,
         "sshport": 2222,
 	"keyfile": "/root/.ssh/altkey",
@@ -21,6 +21,7 @@
 			"retention": "21D"
 		},
 		"/opt": {
+			"prerun": [ "/usr/local/bin/mysql-backup.sh" ]
 			"excludes": [ "**backup" ]
 		},
 		"/root": { 
@@ -34,3 +35,4 @@
 		}
 	}
 }
+

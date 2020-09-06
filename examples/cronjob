@@ -1,4 +1,5 @@
 #Ping the host first then use trickle to throttle the backup jobs
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 */4 * * *	root	ping remotehost -c 3 2>&1 > /dev/null && trickle -s -u 5120 -d 5120 /usr/local/bin/RdiffBackup --cron
 
 #Make sure /media/extdrive/backups/rdiffbackupdisk exists
