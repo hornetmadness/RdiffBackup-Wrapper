@@ -10,7 +10,7 @@
 #v1.2.4 Code Clean up
 #v1.3 Added lockfile to prevent dup process
 #v1.4 Can now specify smtp server, port and allowed --time on --runrentention
-
+#1.4.1 can now define array prerun for each source
 
 use strict;
 use Getopt::Long;
@@ -19,7 +19,7 @@ use FindBin qw($Script);
 use Data::Dumper;
 use Mail::Sendmail;
 
-my $VERSION="1.4";
+my $VERSION="1.4.1";
 
 my %opt;
 GetOptions( #GET CLI OPTIONS
@@ -221,16 +221,33 @@ if (!%{$sources}) {
         #perform any prerun tasks
         if ($obj->{prerun}) {
             addmess("---PreRun");
-            addmess($obj->{prerun});
-            print "Running PreRun task \"$obj->{prerun}\" for $src\n" if $debug;
-            my ($res, $ecode)=doit( $obj->{prerun} );
-            addmess($res) if $res;
-            if ( $ecode ) {
-                my $mess="Prerun Task Failed, skipping backup of $src";
-                addmess($mess);
-                if (!$obj->{ignoreprefail} ) {
-                    $backupstate=$mess;
-                    next;
+            if ( @{$obj->{prerun}}) {
+                foreach my $run (@{$obj->{prerun}}) {
+                    addmess($run);
+                    print "Running PreRun task \"$run\" for $src\n" if $debug;
+                    my ($res, $ecode)=doit( $run );
+                    addmess($res) if $res;
+                    if ( $ecode ) {
+                        my $mess="Prerun Task Failed, skipping backup of $src";
+                        addmess($mess);
+                        if (!$obj->{ignoreprefail} ) {
+                            $backupstate=$mess;
+                            next;
+                        }
+                    }        
+                }
+            } else {
+                addmess($obj->{prerun});
+                print "Running PreRun task \"$obj->{prerun}\" for $src\n" if $debug;
+                my ($res, $ecode)=doit( $obj->{prerun} );
+                addmess($res) if $res;
+                if ( $ecode ) {
+                    my $mess="Prerun Task Failed, skipping backup of $src";
+                    addmess($mess);
+                    if (!$obj->{ignoreprefail} ) {
+                        $backupstate=$mess;
+                        next;
+                    }
                 }
             }
         }
@@ -303,16 +320,34 @@ if (!%{$sources}) {
         #run any postrun tasks
         if ($obj->{postrun}) {
             addmess("---PostRun");
-            addmess($obj->{postrun});
-            print "Running PostRun task \"$obj->{postrun}\" for $src\n" if $debug;
-            my ($res, $ecode)=doit( $obj->{postrun} );
-            addmess($res) if $res;
-            if ($ecode) { 
-                my $mess="Postrun Failed for $src";
-                addmess($mess); 
-                if ( !$obj->{ignorepostfail} ) {
-                    $backupstate=$mess;
-                    next; 
+            if (@{$obj->{postrun}}) {
+                foreach my $prun (@{$obj->{postrun}}) {
+                    addmess("---PostRun");
+                    addmess($prun);
+                    print "Running PostRun task \"$prun\" for $src\n" if $debug;
+                    my ($res, $ecode)=doit( $prun );
+                    addmess($res) if $res;
+                    if ($ecode) { 
+                        my $mess="Postrun Failed for $src";
+                        addmess($mess); 
+                        if ( !$obj->{ignorepostfail} ) {
+                            $backupstate=$mess;
+                            next; 
+                        }
+                    }
+                }   
+            } else {
+                addmess($obj->{postrun});
+                print "Running PostRun task \"$obj->{postrun}\" for $src\n" if $debug;
+                my ($res, $ecode)=doit( $obj->{postrun} );
+                addmess($res) if $res;
+                if ($ecode) { 
+                    my $mess="Postrun Failed for $src";
+                    addmess($mess); 
+                    if ( !$obj->{ignorepostfail} ) {
+                        $backupstate=$mess;
+                        next; 
+                    }
                 }
             }
         }
