@@ -11,6 +11,7 @@
 #v1.3 Added lockfile to prevent dup process
 #v1.4 Can now specify smtp server, port and allowed --time on --runrentention
 #1.4.1 can now define array prerun for each source
+#1.4.2 Catch signals for better lockfile handeling
 
 use strict;
 use Getopt::Long;
@@ -19,7 +20,7 @@ use FindBin qw($Script);
 use Data::Dumper;
 use Mail::Sendmail;
 
-my $VERSION="1.4.1";
+my $VERSION="1.4.2";
 
 my %opt;
 GetOptions( #GET CLI OPTIONS
@@ -56,6 +57,9 @@ my $rdiffDefOpts="--exclude-sockets --exclude-fifos --exclude-device-files --cre
 my $defaultConfig = "/etc/$process.conf";
 my $lockfile = "/var/tmp/$process.lock";
 my $lockfileage=86400; #seconds
+
+$SIG{INT} = \&signal_death;
+$SIG{TERM} = \&signal_death;
 
 &help if $opt{help};
 
@@ -697,6 +701,12 @@ sub readconfig {
 
     print Data::Dumper->new([$config],[qw(*config*)])->Indent(3)->Quotekeys(0)->Dump if $debug;
 }
+
+sub signal_death {
+    my $signal = shift;
+    death(1, "Caught a signal SIG${signal}\n");
+}
+    
 
 sub death {
     my $ecode=shift;
